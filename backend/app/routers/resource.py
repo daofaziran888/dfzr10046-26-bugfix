@@ -5,7 +5,7 @@ import csv
 import io
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
@@ -83,8 +83,49 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
 
 
 @router.post("/{module}", response_model=ActionResult)
-def create_entry(module: str, payload: EntryPayload) -> ActionResult:
+def create_entry(
+    module: str,
+    payload: EntryPayload,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_request_key: str | None = Header(default=None, alias="X-Request-Key"),
+) -> ActionResult:
     service = require_service(module)
+    request_key = (
+        payload.request_key
+        or payload.idempotency_key
+        or payload.request_id
+        or payload.client_token
+        or payload.submission_id
+        or (idempotency_key or x_request_key or "").strip()
+        or None
+    )
+
+    # 迟到事实走带受理凭证的完整链路：幂等重投 + 跨模块重跑待办
+    if module == "late_fact" and hasattr(service, "accept_submission"):
+        result = service.accept_submission(
+            payload.values, request_key=request_key,
+        )
+        if not result.get("ok"):
+            missing = result.get("missing")
+            if missing:
+                return ActionResult(
+                    ok=False, message=f"缺少必填字段：{'、'.join(missing)}",
+                    state="failed", persisted=False,
+                )
+            return ActionResult(
+                ok=False, message=result.get("message", "登记失败"),
+                state="failed", persisted=False,
+            )
+        return ActionResult(
+            ok=True,
+            message=result.get("message", f"{service.ENTITY}已登记"),
+            entry=result.get("entry"),
+            receipt=result.get("receipt"),
+            continued=bool(result.get("continued")),
+            state=result.get("state", "accepted"),
+            persisted=True,
+        )
+
     entry, missing = service.create_entry(payload.values)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
